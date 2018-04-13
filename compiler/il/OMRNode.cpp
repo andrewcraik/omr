@@ -6063,7 +6063,19 @@ OMR::Node::setIsSafeForCGToFastPathUnsafeCall(bool v)
    _flags.set(unsafeFastPathCall);
    }
 
+bool
+OMR::Node::isFearGeneratingCall()
+   {
+   TR_ASSERT(self()->getOpCode().isCall(), "Opcode must be call");
+   return _flags.testAny(fearGeneratingCall);
+   }
 
+void
+OMR::Node::setIsFearGeneratingCall(bool v)
+   {
+   TR_ASSERT(self()->getOpCode().isCall(), "Opcode must be call");
+   _flags.set(fearGeneratingCall, v);
+   }
 
 bool
 OMR::Node::containsCompressionSequence()

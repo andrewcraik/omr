@@ -1094,6 +1094,9 @@ public:
    bool isSafeForCGToFastPathUnsafeCall();
    void setIsSafeForCGToFastPathUnsafeCall(bool v);
 
+   bool isFearGeneratingCall();
+   void setIsFearGeneratingCall(bool v);
+
    // Flag used by TR::ladd and TR::lsub or by TR::lshl and TR::lshr for compressedPointers
    bool containsCompressionSequence();
    void setContainsCompressionSequence(bool v);
@@ -1854,6 +1857,7 @@ protected:
       desynchronizeCall                     = 0x00020000,
       preparedForDirectToJNI                = 0x00040000, // TODO: make J9_PROJECT_SPECIFIC
       unsafeFastPathCall                    = 0x00080000, // TODO: make J9_PROJECT_SPECIFIC
+      fearGeneratingCall                    = 0x00100000,
 
       // Flag used by TR::ladd and TR::lsub or by TR::lshl and TR::lshr for compressedPointers
       isCompressionSequence                 = 0x00000800,
