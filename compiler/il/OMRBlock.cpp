@@ -25,6 +25,7 @@
 #include <stdint.h>
 #include <string.h>
 #include <stdio.h>
+#include <map>
 #include "codegen/CodeGenerator.hpp"
 #include "codegen/FrontEnd.hpp"
 #include "compile/Compilation.hpp"
@@ -58,6 +59,7 @@
 #include "infra/BitVector.hpp"
 #include "infra/Cfg.hpp"
 #include "infra/Flags.hpp"
+#include "infra/ILWalk.hpp"
 #include "infra/Link.hpp"
 #include "infra/List.hpp"
 #include "infra/CfgEdge.hpp"
@@ -895,6 +897,329 @@ OMR::Block::split(TR::TreeTop * startOfNewBlock, TR::CFG * cfg, bool fixupCommon
    return block2;
    }
 
+typedef TR::typed_allocator<std::pair<TR::Node*, std::pair<int32_t, TR::Node*> >, TR::Region&> NodeTableAllocator;
+typedef std::less< TR::Node* > NodeTableComparator;
+typedef std::map<TR::Node*, std::pair<int32_t, TR::Node*>, NodeTableComparator, NodeTableAllocator> NodeTable;
+
+static void replaceNodesInSubtree(TR::Node *node, NodeTable *nodeInfo, TR::NodeChecklist &checklist)
+   {
+   if (checklist.contains(node))
+      return;
+
+   checklist.add(node);
+
+   for (int i = 0; i < node->getNumChildren(); ++i)
+      {
+      TR::Node *child = node->getChild(i);
+      auto entry = nodeInfo->find(child);
+      if (entry != nodeInfo->end())
+         {
+         node->setAndIncChild(i, entry->second.second);
+         child->recursivelyDecReferenceCount();
+         }
+      else
+         {
+         replaceNodesInSubtree(child, nodeInfo, checklist);
+         }
+      }
+   }
+
+static void replaceNodesInTrees(TR::Compilation * comp, TR::TreeTop *start, TR::TreeTop *end, NodeTable *nodeInfo)
+   {
+   TR::NodeChecklist checklist(comp);
+   while (start && start != end)
+      {
+      replaceNodesInSubtree(start->getNode(), nodeInfo, checklist);
+      start = start->getNextTreeTop();
+      }
+   }
+
+static void gatherUnavailableRegisters(TR::Compilation *comp, TR::Node *regDeps, TR_BitVector &unavailableRegisters, NodeTable *nodeInfo)
+   {
+   TR_ASSERT_FATAL(regDeps->getOpCodeValue() == TR::GlRegDeps, "A GlRegDeps node is required to gather unavaialble registers\n");
+   for (int i = 0; i < regDeps->getNumChildren(); ++i)
+      {
+      TR::Node *dep = regDeps->getChild(i);
+      bool requiresRegisterPair = false;
+      if (dep->getOpCodeValue() == TR::PassThrough)
+         {
+         TR::Node *value = dep->getFirstChild();
+         auto entry = nodeInfo->find(value);
+         if (entry == nodeInfo->end() || entry->second.second != NULL)
+            continue;
+
+         requiresRegisterPair = value->requiresRegisterPair(comp);
+         }
+      else if (dep->getOpCode().isLoadReg())
+         {
+         continue;
+         /*auto entry = nodeInfo->find(dep);
+         if (entry == nodeInfo->end() || entry->second.second != NULL)
+            continue;
+
+         requiresRegisterPair = dep->requiresRegisterPair(comp);*/
+         }
+      else
+         TR_ASSERT_FATAL(false, "Expected to find only PassThrough and regLoad operations under a GlRegDepNode!");
+
+      if (requiresRegisterPair)
+         {
+         unavailableRegisters.set(dep->getLowGlobalRegisterNumber());
+         unavailableRegisters.set(dep->getHighGlobalRegisterNumber());
+         }
+      else
+         {
+         unavailableRegisters.set(dep->getGlobalRegisterNumber());
+         }
+      }
+   }
+
+static std::pair<TR_GlobalRegisterNumber,TR_GlobalRegisterNumber> findAvailableRegister(TR::Compilation *comp, TR::Node *node, TR_BitVector &unavailableRegisters)
+   {
+   TR_GlobalRegisterNumber firstGPR = comp->cg()->getFirstGlobalGPR();
+   TR_GlobalRegisterNumber lastGPR = comp->cg()->getLastGlobalGPR();
+   TR_GlobalRegisterNumber firstFPR = comp->cg()->getFirstGlobalFPR();
+   TR_GlobalRegisterNumber lastFPR = comp->cg()->getLastGlobalFPR();
+   TR_GlobalRegisterNumber firstVRF = comp->cg()->getFirstGlobalVRF();
+   TR_GlobalRegisterNumber lastVRF = comp->cg()->getLastGlobalVRF();
+
+   std::pair<TR_GlobalRegisterNumber,TR_GlobalRegisterNumber> toReturn = std::make_pair<TR_GlobalRegisterNumber,TR_GlobalRegisterNumber>(-1,-1);
+
+   TR_GlobalRegisterNumber start, end;
+   TR::DataType dt = node->getType();
+   if (dt.isIntegral() || dt.isAddress())
+      {
+      start = firstGPR;
+      end = lastGPR;
+      }
+   else if (dt.isFloatingPoint())
+      {
+      start = firstFPR;
+      end = lastFPR;
+      }
+   else if (dt.isVector())
+      {
+      start = firstVRF;
+      end = lastVRF;
+      }
+   else
+      TR_ASSERT_FATAL(false, "Unknown data type encountered when trying to pick a register for postGRA block splitting!");
+
+   for (TR_GlobalRegisterNumber itr = start; itr < end; ++itr)
+      {
+      if (!unavailableRegisters.get(itr))
+         {
+         toReturn.first = itr;
+         unavailableRegisters.set(itr);
+         break;
+         }
+      }
+   if (node->requiresRegisterPair(comp) && toReturn.first > -1)
+      {
+      for (TR_GlobalRegisterNumber itr = start; itr < end; ++itr)
+         {
+         if (!unavailableRegisters.get(itr))
+            {
+            toReturn.second = itr;
+            unavailableRegisters.set(itr);
+            break;
+            }
+         }
+      if (toReturn.second == -1)
+         {
+         unavailableRegisters.reset(toReturn.first);
+         toReturn.first = -1;
+         }
+      }
+   return toReturn;
+   }
+ 
+TR::Block * OMR::Block::splitPostGRA(TR::TreeTop *startOfNewBlock, TR::CFG *cfg, bool copyExceptionSuccessors, TR::ResolvedMethodSymbol *methodSymbol)
+   {
+   TR::Compilation * comp = cfg->comp();
+   TR::Block *newBlock = self()->split(startOfNewBlock, cfg, false, copyExceptionSuccessors, methodSymbol);
+   if (methodSymbol == NULL)
+      methodSymbol = comp->getMethodSymbol();
+
+      {
+      // create a stack memory region to facilitate clean-up of the working data structures
+      TR::StackMemoryRegion stackMemoryRegion(*(comp->trMemory()));
+
+      typedef TR::typed_allocator<std::pair<TR::Node*, std::pair<int32_t, TR::Node*> >, TR::Region&> NodeTableAllocator;
+      typedef std::less< TR::Node* > NodeTableComparator;
+      typedef std::map<TR::Node*, std::pair<int32_t, TR::Node*>, NodeTableComparator, NodeTableAllocator> NodeTable;
+
+      NodeTable *nodeInfo = new (stackMemoryRegion) NodeTable(NodeTableComparator(), NodeTableAllocator(stackMemoryRegion));
+
+      // step 1 - find nodes in theis block that will be referenced in the new block
+      // (eg refCount > 0 by the end of the current block
+      TR::TreeTop *start = self()->getEntry();
+      TR::TreeTop *end = self()->getExit();
+      for (TR::PostorderNodeOccurrenceIterator iter(start, comp, "FIX_POSTGRA_SPLIT_COMMONING");
+         iter != end; ++iter)
+         {
+         TR::Node *node = iter.currentNode();
+         auto entry = nodeInfo->find(node);
+         if (entry == nodeInfo->end() && node->getReferenceCount() > 1)
+            {
+            (*nodeInfo)[node] = std::make_pair<int32_t, TR::Node*>(node->getReferenceCount() - 1, NULL);
+            }
+         else if (entry->second.first > 1)
+            {
+            entry->second.first -= 1;
+            }
+         else
+            {
+            nodeInfo->erase(entry);
+            }
+         }
+
+      // step 2 - compute the available registers
+      TR_BitVector unavailableRegisters(0, comp->trMemory(), stackAlloc);
+      for (auto iter = nodeInfo->begin(), end = nodeInfo->end(); iter != end; ++iter)
+         {
+         TR::Node *node = iter->first;
+         if (node->getOpCode().isLoadReg())
+            {
+            if (node->requiresRegisterPair(comp))
+               {
+               unavailableRegisters.set(node->getLowGlobalRegisterNumber());
+               unavailableRegisters.set(node->getHighGlobalRegisterNumber());
+               }
+            else
+               {
+               unavailableRegisters.set(node->getGlobalRegisterNumber());
+               }
+            iter->second.second = TR::Node::copy(node);
+            }
+         }
+
+      for (TR::Block *iter = newBlock, *end = newBlock->getNextExtendedBlock(); iter != end; iter = iter->getNextBlock())
+         {
+         TR::TreeTop *lastRealTT = iter->getLastRealTreeTop();
+         TR::Node *n = lastRealTT ? lastRealTT->getNode() : NULL;
+
+         if (n && n->getOpCode().isBranch() && n->getNumChildren() > 0)
+            {
+            TR::Node *regDeps = n->getChild(n->getNumChildren() - 1);
+            if (regDeps->getOpCodeValue() == TR::GlRegDeps)
+               {
+               gatherUnavailableRegisters(comp, regDeps, unavailableRegisters, nodeInfo);
+               }
+            }
+         else if (n->getOpCode().hasBranchChildren())
+            {
+            for (int32_t i = 0; i < n->getNumChildren(); ++i)
+               {
+               TR::Node *branch = n->getChild(i);
+               if (branch->getOpCode().isBranch() && branch->getNumChildren() > 0)
+                  {
+                  TR::Node *regDeps = n->getChild(n->getNumChildren() - 1);
+                  if (regDeps->getOpCodeValue() == TR::GlRegDeps)
+                     {
+                     gatherUnavailableRegisters(comp, regDeps, unavailableRegisters, nodeInfo);
+                     }
+                  }
+               }
+            }
+
+         if (iter->getNextBlock() == end)
+            {
+            TR::Node *regDeps = iter->getExit()->getNode()->getNumChildren() > 0 ? iter->getExit()->getNode()->getChild(0) : NULL;
+            if (regDeps && regDeps->getOpCodeValue() == TR::GlRegDeps)
+               {
+               gatherUnavailableRegisters(comp, regDeps, unavailableRegisters, nodeInfo);
+               }
+            }
+         }
+
+      // step 3 - create nodes for the entries remaining in the nodeInfo map:
+      //          if we have ar register available:
+      //             1) a PassThrough on the exit glregdeps with the register and the node
+      //             2) a regload of the appropriate regiser on the entry glregdeps
+      //          if no register is available
+      //             1) a store to a temp at the end of the original block
+      int depCount = 0;
+      List<TR::Node> exitDeps(stackMemoryRegion);
+      List<TR::Node> entryDeps(stackMemoryRegion);
+      for (auto iter = nodeInfo->begin(), end = nodeInfo->end(); iter != end; ++iter)
+         {
+         TR::Node *value = iter->first;
+         // if we don't know where we will put the value try to allocate a register otherwise use a temp
+         if (!iter->second.second)
+            {
+            std::pair<TR_GlobalRegisterNumber,TR_GlobalRegisterNumber> regInfo = findAvailableRegister(comp, iter->first, unavailableRegisters);
+            if (regInfo.first > -1)
+               {
+               TR::Node *regLoad = TR::Node::create(value, comp->il.opCodeForRegisterLoad(value->getDataType()));
+               if (regInfo.second > -1)
+                  {
+                  regLoad->setLowGlobalRegisterNumber(regInfo.first);
+                  regLoad->setHighGlobalRegisterNumber(regInfo.second);
+                  }
+               else
+                  {
+                  regLoad->setGlobalRegisterNumber(regInfo.first);
+                  }
+               iter->second.second = regLoad;
+               }
+            else
+               {
+               TR::SymbolReference *symRef = comp->getSymRefTab()->createTemporary(methodSymbol, value->getDataType());
+               iter->second.second = TR::Node::createWithSymRef(value, comp->il.opCodeForDirectLoad(value->getDataType()), 0, symRef);
+               }
+            }
+         TR::Node *replacement = iter->second.second;
+         // now we know where the value will be stored handle the two cases in step 3 based on the opcode type
+         if (replacement->getOpCode().isLoadReg())
+            {
+            depCount++;
+            if (value->getOpCode().isLoadReg())
+               {
+               exitDeps.add(value);
+               }
+            else
+               {
+               TR::Node *passthrough = TR::Node::create(value, TR::PassThrough, 1, value);
+               passthrough->setLowGlobalRegisterNumber(replacement->getLowGlobalRegisterNumber());
+               passthrough->setHighGlobalRegisterNumber(replacement->getHighGlobalRegisterNumber());
+               exitDeps.add(passthrough);
+               entryDeps.add(replacement);
+               }
+            entryDeps.add(replacement);
+            }
+         else
+            {
+            self()->getExit()->insertBefore(TR::TreeTop::create(comp,
+               TR::Node::createWithSymRef(iter->first, comp->il.opCodeForDirectStore(value->getDataType()), 1, value, iter->second.second->getSymbolReference())));
+            }
+         }
+
+      ListIterator<TR::Node> entryIter(&entryDeps);
+      TR::Node *entryGlRegDeps = TR::Node::create(newBlock->getEntry()->getNode(), TR::GlRegDeps, depCount);
+      int childIdx = 0;
+      for (TR::Node *dep = entryIter.getCurrent(); dep; dep=entryIter.getNext())
+         {
+         entryGlRegDeps->setAndIncChild(childIdx++, dep);
+         }
+
+      ListIterator<TR::Node> exitIter(&exitDeps);
+      TR::Node *exitGlRegDeps = TR::Node::create(self()->getExit()->getNode(), TR::GlRegDeps, depCount);
+      childIdx = 0;
+      for (TR::Node *dep = exitIter.getCurrent(); dep; dep=exitIter.getNext())
+         {
+         exitGlRegDeps->setAndIncChild(childIdx++, dep);
+         }
+      
+      newBlock->getEntry()->getNode()->addChildren(&entryGlRegDeps, 1);
+      self()->getExit()->getNode()->addChildren(&exitGlRegDeps, 1);
+
+      // step 4 - replace the nodes in our nodeInfo map with the new versions
+      replaceNodesInTrees(comp, newBlock->getEntry()->getNextTreeTop(), newBlock->getNextExtendedBlock()->getEntry(), nodeInfo);
+      }
+
+   return newBlock;
+   }
 
 TR::Block *
 OMR::Block::splitBlockAndAddConditional(TR::TreeTop *tree,
