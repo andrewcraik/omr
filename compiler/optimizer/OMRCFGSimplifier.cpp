@@ -822,10 +822,29 @@ bool OMR::CFGSimplifier::simplifyBooleanStore(bool needToDuplicateTree)
       {
       TR::Node *base1 = store1->getFirstChild();
       TR::Node *base2 = store2->getFirstChild();
-      if (!base1->getOpCode().hasSymbolReference() || !base2->getOpCode().hasSymbolReference())
+      if (base1->getOpCode().hasSymbolReference()
+          && base2->getOpCode().hasSymbolReference())
+         {
+         if (base1->getSymbolReference()->getReferenceNumber() != base2->getSymbolReference()->getReferenceNumber())
+            return false;
+         }
+      else if ((base1->getOpCodeValue() == TR::aladd && base2->getOpCodeValue() == TR::aladd)
+               || (base1->getOpCodeValue() == TR::aiadd && base2->getOpCodeValue() == TR::aiadd))
+         {
+         if (!base1->getFirstChild()->getOpCode().hasSymbolReference()
+             || !base2->getFirstChild()->getOpCode().hasSymbolReference()
+             || base1->getFirstChild()->getSymbolReference()->getReferenceNumber() != base2->getFirstChild()->getSymbolReference()->getReferenceNumber())
+            return false;
+         if (!base1->getSecondChild()->getOpCode().isLoadConst()
+             || !base2->getSecondChild()->getOpCode().isLoadConst()
+             || base1->getSecondChild()->getConstValue() != base2->getSecondChild()->getConstValue())
+            return false;
+         }
+      else
+         {
          return false;
-      if (base1->getSymbolReference()->getReferenceNumber() != base2->getSymbolReference()->getReferenceNumber())
-         return false;
+         }
+
       if (trace())
          traceMsg(comp(), "   Indirect store base node opcode and symref checks out\n");
       }
