@@ -121,6 +121,11 @@ void simplifyChildren(TR::Node * node, TR::Block * block, TR::Simplifier * s)
          child = s->simplify(child, block);
          node->setChild(i, child);
          }
+      if (!node->getOpCode().isNullCheck() && child->getOpCodeValue() == TR::PassThrough)
+         {
+         node->setAndIncChild(i, child->getFirstChild());
+         child->recursivelyDecReferenceCount();
+         }
       }
    }
 
